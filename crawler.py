@@ -9,7 +9,7 @@ import random # 페이지 간 요청 딜레이를 위해 추가 (필요시)
 
 logger = LoggerUtil().get_logger()
 
-def crawl_top_investors():
+def crawl_top_investors(top_count=5):
     ua = UserAgent()
     url = "https://dataroma.com/m/managers.php"
     headers = {"User-Agent": ua.random}
@@ -78,10 +78,12 @@ def crawl_top_investors():
     if not investors:
         logger.warning("No investors data extracted. Returning empty list.")
         return []
-        
-    top5 = sorted(investors, key=lambda x: x["value"], reverse=True)[:5]
-    logger.info(f"Top 5 investors after sorting: {top5}")
-    return top5
+    
+    # 가져올 상위 투자자 수 제한
+    top_count = max(1, min(top_count, len(investors)))  # 최소 1명, 최대 전체 수
+    top_investors = sorted(investors, key=lambda x: x["value"], reverse=True)[:top_count]
+    logger.info(f"Top {top_count} investors after sorting: {top_investors}")
+    return top_investors
 
 def _parse_portfolio_summary(soup):
     try:
