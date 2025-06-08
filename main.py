@@ -3,6 +3,7 @@ from crawler import crawl_top_investors, crawl_dataroma_portfolio_page
 from utils.db_manager import get_db_connection, create_tables_if_not_exists, check_portfolio_exists, insert_investor_portfolio, insert_portfolio_details
 from utils.logger_util import LoggerUtil
 from utils.api_util import ApiUtil  # API 유틸 추가
+from utils.telegram_util import TelegramUtil  # 텔레그램 유틸 추가
 
 def main():
     # LoggerUtil 클래스를 사용하여 로거 초기화
@@ -24,6 +25,8 @@ def main():
 
         # API 유틸 초기화
         api_util = ApiUtil()
+        # 텔레그램 유틸 초기화
+        telegram_util = TelegramUtil()
 
         logger.info(f"--- 상위 {len(top_investors)}명 투자자 포트폴리오 DB 저장 시작 ---")
         for investor in top_investors:
@@ -71,6 +74,12 @@ def main():
                             writer="admin"
                         )
                         logger.info(f"API 전송 완료 - {investor_name} (p_idx: {p_idx})")
+                        
+                        # API 전송 완료 후 텔레그램으로 메시지 전송
+                        telegram_message = f"[알림] 포트폴리오 업데이트 완료\n\n투자자: {investor_name} ({investor_code})\n날짜: {portfolio_summary['portfolio_date']}\n보유 종목 수: {portfolio_summary['number_of_stocks']}\n포트폴리오 가치: ${portfolio_summary['portfolio_value'] / 1_000_000_000:.2f}B"
+                        telegram_util.send_test_message(telegram_message)
+                        logger.info(f"텔레그램 알림 전송 완료 - {investor_name}")
+                        
                     except Exception as e_api:
                         logger.error(f"API 전송 중 오류 발생 ({investor_name} - {investor_code}): {e_api}")
                 
