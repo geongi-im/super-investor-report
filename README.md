@@ -69,6 +69,9 @@ DB_PORT=3306
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
 
+# BASE URL
+BASE_URL=http://example.com
+
 # API 키 설정 (선택사항)
 API_KEY=your_api_key
 ```

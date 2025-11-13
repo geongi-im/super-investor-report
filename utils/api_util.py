@@ -3,7 +3,9 @@ from typing import List, Optional
 import os
 import io
 from utils.logger_util import LoggerUtil
+from dotenv import load_dotenv
 
+load_dotenv()
 class ApiError(Exception):
     """API 호출 관련 커스텀 예외"""
     def __init__(self, status_code: int, message: str):
@@ -13,7 +15,12 @@ class ApiError(Exception):
 
 class ApiUtil:
     def __init__(self):
-        self.base_url = "http://localhost/api"
+        base_url = os.getenv("BASE_URL")
+        if not base_url:
+            raise EnvironmentError("환경 변수 'BASE_URL'가 설정되어 있지 않습니다.")
+
+        base_url = base_url.rstrip("/")
+        self.api_base_url = f"{base_url}/api"
         self.headers = {
             "Accept": "application/json"
         }
@@ -21,7 +28,7 @@ class ApiUtil:
 
     def create_post(self, title: str, portfolio_idx: str, investor_code: str, writer: str):
         """게시글 생성 API 호출"""
-        url = f"{self.base_url}/board-portfolio"
+        url = f"{self.api_base_url}/board-portfolio"
         
         try:
             self.logger.info(f"게시글 생성 시작 (이미지 없음) - 제목: {title}")
