@@ -92,7 +92,7 @@ def main():
                     
                     # API 전송 완료 후 텔레그램으로 메시지 전송
                     telegram_message = f"[알림] 포트폴리오 신규 저장 완료\n\n투자자: {investor_name} ({investor_code})\n날짜: {portfolio_summary['portfolio_date']}\n보유 종목 수: {portfolio_summary['number_of_stocks']}\n포트폴리오 가치: ${portfolio_summary['portfolio_value'] / 1_000_000_000:.2f}B"
-                    telegram_util.send_test_message(telegram_message)
+                    telegram_util.send_message(telegram_message)
                     logger.info(f"텔레그램 알림 전송 완료 - {investor_name}")
                     
                 except Exception as e_api:
