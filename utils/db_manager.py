@@ -157,7 +157,10 @@ def update_portfolio_details(conn, p_idx, details):
                 ticker = detail.get('ticker')
                 if not ticker:
                     continue
-                    
+                # 이번 실행에서 시세를 못 받은 종목은 이전에 저장된 시세를 NULL 로 덮어쓰지 않는다
+                if detail.get('current_price') is None:
+                    continue
+
                 # 해당 ticker의 현재 가격 정보 업데이트
                 update_sql = """
                 UPDATE investor_portfolio_detail 
@@ -195,7 +198,7 @@ def calculate_and_update_portfolio_avg_return(conn, p_idx):
             select_sql = """
             SELECT portfolio_rate, reported_price_rate 
             FROM investor_portfolio_detail 
-            WHERE p_idx = %s AND portfolio_rate > 0
+            WHERE p_idx = %s AND portfolio_rate > 0 AND reported_price_rate IS NOT NULL
             """
             cursor.execute(select_sql, (p_idx,))
             details = cursor.fetchall()
@@ -259,10 +262,13 @@ def insert_portfolio_details(conn, p_idx, details):
             try:
                 # 종목 비중과 수익률 추출
                 portfolio_rate = float(detail.get('portfolio_rate', 0))
-                reported_price_rate = float(detail.get('reported_price_rate', 0))
-                
+                # 시세를 찾지 못한 종목은 None 으로 저장하고 평균 수익률 계산에서 뺀다
+                reported_price_rate = detail.get('reported_price_rate')
+                if reported_price_rate is not None:
+                    reported_price_rate = float(reported_price_rate)
+
                 # 가중 수익률 계산 (비중 * 수익률)
-                if portfolio_rate > 0:
+                if portfolio_rate > 0 and reported_price_rate is not None:
                     total_weighted_return += portfolio_rate * reported_price_rate
                     total_weight += portfolio_rate
                     valid_items_count += 1

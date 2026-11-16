@@ -51,6 +51,7 @@ Desktop.ini
 
 # Custom
 temp/
+cache/
 *.temp
 
 # Distribution / packaging

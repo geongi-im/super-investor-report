@@ -4,12 +4,17 @@
 
 ## 개요
 
-이 프로젝트는 Dataroma.com에서 상위 투자자들의 포트폴리오 데이터를 수집하고, 이를 MySQL 데이터베이스에 저장합니다. 수집된 데이터를 바탕으로 포트폴리오 구성 및 변동 사항을 시각화하여 보고서를 생성할 수 있습니다.
+이 프로젝트는 SEC EDGAR 에 공시된 13F 신고서 원본에서 투자자들의 포트폴리오 데이터를 수집하고, 이를 MySQL 데이터베이스에 저장합니다. 수집된 데이터를 바탕으로 포트폴리오 구성 및 변동 사항을 시각화하여 보고서를 생성할 수 있습니다.
+
+수집 대상 투자자는 `investors.py` 에 투자자 코드, 이름, SEC CIK 로 등록합니다. 13F 를 제출하는 기관이면 CIK 만 추가해서 대상에 넣을 수 있습니다.
 
 ## 주요 기능
 
-- 상위 투자자 정보 자동 크롤링
+- SEC EDGAR 13F 신고서 수집 (정정 신고 반영, 옵션/채권 제외, 같은 종목 합산)
 - 포트폴리오 상세 정보 수집 (종목, 비중, 변동 사항 등)
+  - 티커: OpenFIGI 로 CUSIP 을 변환 (`cache/cusip_ticker.json` 에 캐시)
+  - 최근 활동(buy/add/reduce): 직전 분기 13F 와 보유 주식 수 비교
+  - 현재가, 52주 최저/최고가: yfinance
 - MySQL 데이터베이스에 데이터 저장
 - 포트폴리오 시각화 리포트 생성
 - 텔레그램 알림 기능
@@ -21,11 +26,11 @@
 - **언어**: Python 3.x
 - **데이터베이스**: MySQL
 - **주요 라이브러리**:
-  - `requests`, `BeautifulSoup4`: 웹 크롤링
+  - `requests`: SEC EDGAR, OpenFIGI API 호출
+  - `yfinance`: 현재가 및 52주 최저/최고가 조회
   - `pymysql`: MySQL 데이터베이스 연결
   - `dotenv`: 환경 변수 관리
   - `logging`: 로그 관리
-  - `fake_useragent`: 크롤링용 User-Agent 생성
   - `echarts`: 데이터 시각화 (리포트)
   - `python-telegram-bot`: 텔레그램 메시지 발송
 
@@ -74,7 +79,15 @@ BASE_URL=http://example.com
 
 # API 키 설정 (선택사항)
 API_KEY=your_api_key
+
+# SEC EDGAR 요청 헤더 (필수 권장, SEC 요구사항: 이름과 연락 이메일)
+SEC_USER_AGENT=YourName your_email@example.com
+
+# OpenFIGI API 키 (선택사항, https://www.openfigi.com/api 에서 무료 발급)
+OPENFIGI_API_KEY=your_openfigi_api_key
 ```
+
+OpenFIGI 키가 없어도 동작하지만 티커 조회 속도 제한이 커서, 캐시가 없는 첫 실행은 수 분이 걸립니다. 이후 실행은 캐시를 써서 빨라집니다.
 
 5. 데이터베이스 준비
 
@@ -92,7 +105,7 @@ CREATE DATABASE investor_portfolio_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unic
 python main.py
 ```
 
-이 명령어는 상위 투자자들의 포트폴리오 정보를 수집하고 데이터베이스에 저장합니다.
+이 명령어는 `investors.py` 에 등록된 투자자들의 최근 13F 포트폴리오 정보를 수집하고 데이터베이스에 저장합니다.
 
 ### 리포트 생성
 
@@ -106,19 +119,23 @@ python report_generator.py --investor BRK --date 2023-12-31
 
 ```
 super-investor-report/
-├── main.py                   # 메인 실행 파일
-├── crawler.py                # 웹 크롤링 모듈
-├── report_generator.py       # 리포트 생성 모듈
-├── report_template.html      # 리포트 템플릿
-├── requirements.txt          # 의존성 패키지 목록
-├── .env                      # 환경 변수 파일 (git에서 제외됨)
-├── logs/                     # 로그 저장 디렉토리
-├── report/                   # 생성된 리포트 HTML 파일
-└── utils/
-    ├── db_manager.py         # 데이터베이스 관리 모듈
-    ├── logger_util.py        # 로깅 유틸리티 모듈
-    ├── api_util.py           # API 연동 유틸리티 모듈
-    └── telegram_util.py      # 텔레그램 알림 유틸리티 모듈
+  main.py                   # 메인 실행 파일
+  investors.py              # 수집 대상 투자자 목록 (코드, 이름, SEC CIK)
+  crawler.py                # SEC EDGAR 13F 수집 모듈
+  report_generator.py       # 리포트 생성 모듈
+  report_template.html      # 리포트 템플릿
+  requirements.txt          # 의존성 패키지 목록
+  .env                      # 환경 변수 파일 (git에서 제외됨)
+  cache/                    # CUSIP -> 티커 변환 캐시 (git에서 제외됨)
+  logs/                     # 로그 저장 디렉토리
+  report/                   # 생성된 리포트 HTML 파일
+  utils/
+    db_manager.py           # 데이터베이스 관리 모듈
+    logger_util.py          # 로깅 유틸리티 모듈
+    api_util.py             # API 연동 유틸리티 모듈
+    telegram_util.py        # 텔레그램 알림 유틸리티 모듈
+    ticker_util.py          # CUSIP -> 티커 변환 (OpenFIGI)
+    price_util.py           # 현재가/52주 시세 조회 (yfinance)
 ```
 
 ## 데이터베이스 스키마

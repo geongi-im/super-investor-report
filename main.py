@@ -1,5 +1,8 @@
 import sys
-from crawler import crawl_top_investors, crawl_dataroma_portfolio_page
+from crawler import SecClient, crawl_13f_portfolio
+from investors import INVESTORS
+from utils.ticker_util import TickerResolver
+from utils.price_util import PriceFetcher
 from utils.db_manager import get_db_connection, create_tables_if_not_exists, check_portfolio_exists, insert_investor_portfolio, insert_portfolio_details, update_portfolio_details, calculate_and_update_portfolio_avg_return
 from utils.logger_util import LoggerUtil
 from utils.api_util import ApiUtil  # API 유틸 추가
@@ -17,28 +20,27 @@ def main():
     try:
         create_tables_if_not_exists(db_conn) 
 
-        top_count = 10 # 상위 N명의 투자자 정보 가져오기
-        top_investors = crawl_top_investors(top_count)
-        if not top_investors:
-            logger.warning("크롤링된 투자자 정보가 없습니다.")
-            return
-
         # API 유틸 초기화
         api_util = ApiUtil()
         # 텔레그램 유틸 초기화
         telegram_util = TelegramUtil()
 
-        logger.info(f"--- 상위 {len(top_investors)}명 투자자 포트폴리오 DB 저장 시작 ---")
-        for investor in top_investors:
+        # SEC EDGAR 13F 수집용 (티커 변환 결과와 시세는 투자자 사이에 공유한다)
+        sec_client = SecClient()
+        ticker_resolver = TickerResolver()
+        price_fetcher = PriceFetcher()
+
+        logger.info(f"--- 투자자 {len(INVESTORS)}명 포트폴리오 DB 저장 시작 ---")
+        for investor in INVESTORS:
             investor_code = investor['code']
             investor_name = investor['name']
-            
+
             logger.info(f"처리 중인 투자자: {investor_name} ({investor_code})")
 
-            page_data = crawl_dataroma_portfolio_page(investor_code)
+            page_data = crawl_13f_portfolio(investor, sec_client, ticker_resolver, price_fetcher)
 
             if not page_data or not page_data.get("summary"):
-                logger.warning(f"{investor_name}의 포트폴리오 페이지 정보를 가져오는데 실패했습니다. 다음 투자자로 넘어갑니다.")
+                logger.warning(f"{investor_name}의 13F 포트폴리오 정보를 가져오는데 실패했습니다. 다음 투자자로 넘어갑니다.")
                 continue
             
             portfolio_summary = page_data["summary"]

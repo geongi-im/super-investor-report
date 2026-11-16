@@ -1,284 +1,353 @@
-import requests
-from bs4 import BeautifulSoup
-import re
-from datetime import datetime
-from fake_useragent import UserAgent
-from utils.logger_util import LoggerUtil
-import time # 페이지 간 요청 딜레이를 위해 추가 (필요시)
-import random # 페이지 간 요청 딜레이를 위해 추가 (필요시)
+"""SEC EDGAR 13F 포트폴리오 수집
 
+투자자 CIK 로 최근 13F 신고서를 받아 Dataroma 크롤러와 같은 형태({"summary", "details"})로 돌려준다.
+
+- 같은 분기에 정정 신고(13F-HR/A)가 있으면 반영한다.
+  RESTATEMENT 는 원본을 대체하고, NEW HOLDINGS 는 원본에 종목을 추가한다.
+  단 NEW HOLDINGS 로 표시돼 있어도 금액이 원본의 절반 이상이면 전체를 다시 낸 것으로 보고 대체한다.
+  (First Eagle 2026 Q2 처럼 전체 정정을 NEW HOLDINGS 로 표시하는 경우가 있다)
+- 주식(SH)만 집계하고 옵션(Put/Call)과 채권(PRN)은 뺀다.
+- 같은 CUSIP 이 운용 주체별로 여러 줄이면 합친다.
+- 최근 활동(buy/add/reduce)은 직전 분기 13F 와 티커별 보유 주식 수를 비교해 계산한다.
+  직전 분기 CUSIP 의 티커를 찾지 못하면(재설립으로 CUSIP 이 바뀐 경우 등) 발행사명으로 비교한다.
+- 티커는 OpenFIGI, 현재가와 52주 최저/최고가는 yfinance 로 채운다.
+"""
+import os
+import re
+import time
+import xml.etree.ElementTree as ET
+from datetime import datetime
+
+import requests
+from dotenv import load_dotenv
+
+from utils.logger_util import LoggerUtil
+
+load_dotenv()
 logger = LoggerUtil().get_logger()
 
-def crawl_top_investors(top_count=5):
-    ua = UserAgent()
-    url = "https://dataroma.com/m/managers.php"
-    headers = {"User-Agent": ua.random}
-    logger.info(f"Crawling {url}...")
-    resp = requests.get(url, headers=headers, timeout=10)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-    table = soup.find("table", {"id": "grid"})
-    if not table:
-        logger.error("Error: 투자자 테이블을 찾을 수 없습니다.")
-        raise Exception("투자자 테이블을 찾을 수 없습니다.")
-    
-    tbody = table.find("tbody")
-    rows = tbody.find_all("tr") if tbody else table.find_all("tr")
-    if tbody:
-        logger.info(f"Found {len(rows)} rows in tbody.")
-    else:
-        logger.info(f"Found {len(rows)} rows in table (no tbody).")
-        if rows and rows[0].find_all("th"):
-             logger.info("Header row (th elements) found in table, skipping first row.")
-             rows = rows[1:]
-        elif rows and rows[0].find_all("td") and not rows[0].find("a", href=re.compile(r"/m/holdings\.php\?m=\w+")):
-            logger.info("Possible header row (td elements without investor link) found, skipping first row.")
-            rows = rows[1:]
+SEC_DATA_URL = "https://data.sec.gov"
+SEC_ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data"
+FORM_ORIGINAL = "13F-HR"
+FORM_AMENDMENT = "13F-HR/A"
+# 2023-01-03 이후 접수분부터 value 가 달러 단위다. 그 전에는 천 달러 단위였다.
+VALUE_IN_DOLLARS_FROM = "2023-01-03"
+# SEC 는 초당 10회까지 허용한다
+SEC_REQUEST_INTERVAL = 0.15
+MAX_ATTEMPTS = 3
+# DB 컬럼 범위: reported_price_rate DECIMAL(8,4), recent_activity_value DECIMAL(10,2)
+MAX_PRICE_RATE = 9999.9999
+MAX_ACTIVITY_VALUE = 99999999.99
+# 발행사명 비교 때 끝에서 떼어 내는 법인 형태 단어
+LEGAL_SUFFIXES = {
+    "INC", "CORP", "CORPORATION", "CO", "COMPANY", "LTD", "LIMITED", "PLC", "NEW",
+    "HOLDINGS", "HLDGS", "HOLDING", "NV", "SA", "AG", "SE", "LLC", "LP", "THE",
+}
 
-    if not rows:
-        logger.error("Error: No data rows found in table.")
-        return []
-            
-    investors = []
-    for i, row in enumerate(rows):
-        cols = row.find_all("td")
-        if len(cols) < 3:
-            logger.warning(f"Skipping row {i+1} due to insufficient columns: {len(cols)}")
-            continue
-        
-        link_tag = cols[0].find("a")
-        if not link_tag or not link_tag.has_attr("href"):
-            logger.warning(f"Skipping row {i+1} due to missing link or href in first column. First col content: {cols[0].text.strip()}")
-            continue
-            
-        m_code_match = re.search(r"m=(\w+)", link_tag["href"])
-        if not m_code_match:
-            logger.warning(f"Skipping row {i+1} due to m_code pattern not found in href: {link_tag['href']}")
-            continue
-            
-        code = m_code_match.group(1)
-        name = link_tag.text.strip()
-        value_text = cols[1].text.strip().upper().replace("$", "")
-        value = 0
-        try:
-            if "B" in value_text:
-                value = float(value_text.replace("B", "").strip()) * 1_000_000_000
-            elif "M" in value_text:
-                value = float(value_text.replace("M", "").strip()) * 1_000_000
-            else:
-                value = float(value_text.replace(",", "").strip())
-            value = int(value)
-        except ValueError:
-            logger.error(f"ValueError for row {i+1}, value_text: '{value_text}'. Defaulting value to 0.")
-            value = 0
-            
-        investors.append({"code": code, "name": name, "value": value})
-    
-    logger.info(f"Total investors extracted before sorting: {len(investors)}")
-    if not investors:
-        logger.warning("No investors data extracted. Returning empty list.")
-        return []
-    
-    # 가져올 상위 투자자 수 제한
-    top_count = max(1, min(top_count, len(investors)))  # 최소 1명, 최대 전체 수
-    top_investors = sorted(investors, key=lambda x: x["value"], reverse=True)[:top_count]
-    logger.info(f"Top {top_count} investors after sorting: {top_investors}")
-    return top_investors
 
-def _parse_portfolio_summary(soup):
-    try:
-        p2_tag = soup.find("p", id="p2")
-        if not p2_tag:
-            logger.warning("Summary p#p2 tag not found.")
-            return None
-        
-        spans = p2_tag.find_all('span')
-        if len(spans) < 4:
-            logger.warning(f"Expected at least 4 spans in p#p2, found {len(spans)}")
-            return None
+class SecClient:
+    """SEC EDGAR 요청. SEC 는 User-Agent 에 연락처(이름과 이메일)를 넣도록 요구한다"""
 
-        portfolio_period = spans[0].text.strip()
-        portfolio_date_str = spans[1].text.strip()
-        number_of_stocks_str = spans[2].text.strip()
-        portfolio_value_str = spans[3].text.strip()
+    def __init__(self):
+        user_agent = os.getenv("SEC_USER_AGENT")
+        if not user_agent:
+            logger.warning("SEC_USER_AGENT 가 설정되지 않았습니다. SEC 가 요청을 막을 수 있으니 .env 에 '이름 이메일' 형식으로 설정하세요.")
+            user_agent = "super-investor-report"
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"})
+        self._last_request_at = 0.0
 
-        parsed_dt = datetime.strptime(portfolio_date_str, "%d %b %Y")
-        portfolio_date = parsed_dt.strftime("%Y-%m-%d")
-        number_of_stocks = int(number_of_stocks_str)
-        portfolio_value = int(portfolio_value_str.replace("$", "").replace(",", ""))
-
-        return {
-            "portfolio_period": portfolio_period,
-            "portfolio_date": portfolio_date,
-            "number_of_stocks": number_of_stocks,
-            "portfolio_value": portfolio_value
-        }
-    except Exception as e:
-        logger.error(f"Error parsing portfolio summary: {e}", exc_info=True)
-        return None
-
-def _parse_portfolio_details(soup):
-    details = []
-    try:
-        stock_table = soup.find("table", {"id": "grid"})
-        if not stock_table:
-            logger.warning("Details table #grid not found.")
-            return details
-        
-        tbody = stock_table.find("tbody")
-        if not tbody:
-            logger.warning("Details tbody in #grid not found.")
-            return details
-
-        stock_rows = tbody.find_all("tr")
-        logger.debug(f"Found {len(stock_rows)} stock rows for details on current page.")
-
-        for i, row in enumerate(stock_rows):
-            cols = row.find_all("td")
-            if len(cols) < 12: 
-                logger.warning(f"Skipping stock row {i+1} due to insufficient columns: {len(cols)}")
-                continue
-            
+    def get(self, url):
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            wait = SEC_REQUEST_INTERVAL - (time.time() - self._last_request_at)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request_at = time.time()
             try:
-                col1_text_content = cols[1].text.strip()
-                stock_col_1_link = cols[1].find("a")
-                raw_ticker_text = stock_col_1_link.text.strip() if stock_col_1_link else ""
-                ticker = raw_ticker_text 
-                name = ""
-
-                if " - " in raw_ticker_text:
-                    parts = raw_ticker_text.split(" - ", 1)
-                    ticker = parts[0].strip()
-                    name = parts[1].strip() if len(parts) > 1 else ""
-                
-                stock_col_1_span = cols[1].find("span")
-                if stock_col_1_span:
-                    span_name_text = stock_col_1_span.text.strip().lstrip(" -").strip()
-                    if span_name_text: name = span_name_text
-                
-                if not name and ticker and " - " not in raw_ticker_text: 
-                    potential_name_from_col_text = col1_text_content.replace(ticker, "").strip().lstrip(" -").strip()
-                    if potential_name_from_col_text: name = potential_name_from_col_text
-                
-                if not name and ticker: name = ticker
-                
-                if not ticker:
-                    logger.warning(f"Skipping row {i+1} as ticker could not be parsed from: {col1_text_content}")
-                    continue
-                
-                if name == ticker and " - " in ticker:
-                     parts = ticker.split(" - ", 1)
-                     ticker = parts[0].strip()
-                     name = parts[1].strip() if len(parts) > 1 else name
-                
-                if len(ticker) > 50: 
-                    logger.warning(f"Parsed ticker for row {i+1} is too long: '{ticker}' (length {len(ticker)}). Original text: {col1_text_content}")
-                    ticker = ticker[:50] # 티커 길이 제한
-
-                detail_item = {
-                    "ticker": ticker, "name": name,
-                    "portfolio_rate": float(cols[2].text.strip().replace("%", "")),
-                    "shares": int(cols[4].text.strip().replace(",", "")),
-                    "reported_price": float(cols[5].text.strip().replace("$", "").replace(",", "")),
-                    "reported_value_amount": int(cols[6].text.strip().replace("$", "").replace(",", "")),
-                    "current_price": float(cols[8].text.strip().replace("$", "").replace(",", "")),
-                    "reported_price_rate": float(cols[9].text.strip().replace("%", "")),
-                    "low_52_week": float(cols[10].text.strip().replace("$", "").replace(",", "")),
-                    "high_52_week": float(cols[11].text.strip().replace("$", "").replace(",", "")),
-                    "recent_activity_type": None, "recent_activity_value": None
-                }
-                
-                activity_col_text = cols[3].text.strip()
-                if activity_col_text and activity_col_text != "-":
-                    activity_parts = activity_col_text.split(" ")
-                    detail_item["recent_activity_type"] = activity_parts[0].strip().lower()
-                    if len(activity_parts) > 1 and "%" in activity_parts[-1]:
-                        try:
-                            detail_item["recent_activity_value"] = float(activity_parts[-1].replace("%", "").strip())
-                        except ValueError:
-                            logger.warning(f"Could not parse recent_activity_value from {activity_parts[-1]} for row {i+1}")
-                
-                details.append(detail_item)
-            except Exception as e_row:
-                logger.error(f"Error processing stock row {i+1}. Content: {row.text[:100]}. Error: {e_row}", exc_info=True)
+                response = self.session.get(url, timeout=30)
+            except requests.RequestException as e:
+                logger.warning(f"SEC 요청 오류({attempt}/{MAX_ATTEMPTS}) {url}: {e}")
+                time.sleep(2 * attempt)
                 continue
-        return details
-    except Exception as e_table:
-        logger.error(f"Error parsing portfolio details table: {e_table}", exc_info=True)
-        return details
+            if response.status_code == 200:
+                return response
+            if response.status_code == 429 or response.status_code >= 500:
+                logger.warning(f"SEC 응답 {response.status_code}({attempt}/{MAX_ATTEMPTS}) {url}")
+                time.sleep(5 * attempt)
+                continue
+            response.raise_for_status()
+        raise RuntimeError(f"SEC 요청 실패: {url}")
 
-def crawl_dataroma_portfolio_page(m_code):
-    ua = UserAgent()
-    base_url = "https://dataroma.com"
-    initial_page_url = f"{base_url}/m/holdings.php?m={m_code}&L=1" 
-    headers = {"User-Agent": ua.random}
-    
-    all_details_list = []
-    summary_data = None
-    
-    logger.info(f"Crawling initial page data for m_code: {m_code} from {initial_page_url}...")
+    def get_json(self, url):
+        return self.get(url).json()
+
+
+def _local_name(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def _child_text(element, name):
+    for child in element.iter():
+        if _local_name(child.tag) == name:
+            return (child.text or "").strip()
+    return ""
+
+
+def _to_int(text):
     try:
-        resp = requests.get(initial_page_url, headers=headers, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+        return int(float(text.replace(",", "")))
+    except (ValueError, AttributeError):
+        return 0
 
-        summary_data = _parse_portfolio_summary(soup)
-        if summary_data is None:
-            logger.error(f"Failed to parse summary for {m_code} on initial page ({initial_page_url}). Aborting.")
+
+def _period_label(period_date):
+    """2026-09-30 -> Q3 2026"""
+    dt = datetime.strptime(period_date, "%Y-%m-%d")
+    return f"Q{(dt.month - 1) // 3 + 1} {dt.year}"
+
+
+def _list_13f_filings(sec, cik):
+    data = sec.get_json(f"{SEC_DATA_URL}/submissions/CIK{cik:010d}.json")
+    recent = data["filings"]["recent"]
+    filings = []
+    for i, form in enumerate(recent["form"]):
+        if form not in (FORM_ORIGINAL, FORM_AMENDMENT):
+            continue
+        filings.append({
+            "form": form,
+            "accession": recent["accessionNumber"][i],
+            "filing_date": recent["filingDate"][i],
+            "period": recent["reportDate"][i],
+        })
+    return filings
+
+
+def _filing_base_url(cik, accession):
+    return f"{SEC_ARCHIVE_URL}/{cik}/{accession.replace('-', '')}"
+
+
+def _get_amendment_type(sec, cik, filing):
+    root = ET.fromstring(sec.get(f"{_filing_base_url(cik, filing['accession'])}/primary_doc.xml").content)
+    return _child_text(root, "amendmentType").upper()
+
+
+def _get_info_table_rows(sec, cik, filing):
+    """신고서의 information table 을 읽어 주식 행 목록을 돌려준다"""
+    base_url = _filing_base_url(cik, filing["accession"])
+    index = sec.get_json(f"{base_url}/index.json")
+    xml_names = [
+        item["name"] for item in index["directory"]["item"]
+        if item["name"].lower().endswith(".xml") and item["name"].lower() != "primary_doc.xml"
+    ]
+
+    root = None
+    for name in xml_names:
+        candidate = ET.fromstring(sec.get(f"{base_url}/{name}").content)
+        if _local_name(candidate.tag) == "informationTable":
+            root = candidate
+            break
+    if root is None:
+        logger.warning(f"information table 을 찾지 못했습니다: {base_url}")
+        return []
+
+    multiplier = 1 if filing["filing_date"] >= VALUE_IN_DOLLARS_FROM else 1000
+    rows = []
+    for entry in root:
+        if _local_name(entry.tag) != "infoTable":
+            continue
+        if _child_text(entry, "putCall"):
+            continue
+        if _child_text(entry, "sshPrnamtType").upper() != "SH":
+            continue
+        shares = _to_int(_child_text(entry, "sshPrnamt"))
+        if shares <= 0:
+            continue
+        rows.append({
+            "cusip": _child_text(entry, "cusip").upper(),
+            "name": _child_text(entry, "nameOfIssuer"),
+            "value": _to_int(_child_text(entry, "value")) * multiplier,
+            "shares": shares,
+        })
+    return rows
+
+
+def _get_period_rows(sec, cik, filings, period):
+    """한 분기의 원본과 정정 신고를 접수 순서대로 반영한 행 목록"""
+    period_filings = sorted(
+        (f for f in filings if f["period"] == period),
+        key=lambda f: (f["filing_date"], f["accession"]),
+    )
+    rows = None
+    for filing in period_filings:
+        filing_rows = _get_info_table_rows(sec, cik, filing)
+        if filing["form"] == FORM_ORIGINAL or rows is None:
+            rows = filing_rows
+            continue
+
+        amendment_type = _get_amendment_type(sec, cik, filing)
+        if amendment_type == "RESTATEMENT":
+            logger.info(f"정정 신고(RESTATEMENT) 반영: {filing['accession']}")
+            rows = filing_rows
+        else:
+            base_value = sum(r["value"] for r in rows)
+            added_value = sum(r["value"] for r in filing_rows)
+            if base_value and added_value >= base_value * 0.5:
+                logger.info(
+                    f"정정 신고({amendment_type or '유형 없음'})의 금액이 원본의 절반 이상이라 전체 정정으로 보고 대체합니다: {filing['accession']}"
+                )
+                rows = filing_rows
+            else:
+                logger.info(f"정정 신고({amendment_type or '유형 없음'}) 종목 {len(filing_rows)}건 추가: {filing['accession']}")
+                rows = rows + filing_rows
+    return rows or []
+
+
+def _aggregate_by_cusip(rows):
+    holdings = {}
+    for row in rows:
+        holding = holdings.get(row["cusip"])
+        if holding is None:
+            holdings[row["cusip"]] = dict(row)
+        else:
+            holding["value"] += row["value"]
+            holding["shares"] += row["shares"]
+    return holdings
+
+
+def _shares_by_key(holdings, tickers):
+    """보유 주식 수를 티커 기준으로 합친다. 티커를 모르는 CUSIP 은 CUSIP 을 키로 쓴다.
+    합병이나 재설립으로 CUSIP 만 바뀐 종목, 한 종목이 여러 CUSIP 으로 보고된 경우도 같은 종목으로 비교하기 위함이다.
+    """
+    shares = {}
+    for cusip, holding in holdings.items():
+        key = tickers.get(cusip, cusip)
+        shares[key] = shares.get(key, 0) + holding["shares"]
+    return shares
+
+
+def _normalize_name(name):
+    """발행사명 비교용. 'EXXON MOBIL CORP' 와 'EXXONMOBIL HOLDINGS CORP' 를 같은 값으로 만든다"""
+    words = re.sub(r"[^A-Z0-9 ]", " ", (name or "").upper()).split()
+    while words and words[-1] in LEGAL_SUFFIXES:
+        words.pop()
+    return "".join(words)
+
+
+def _unmapped_shares_by_name(prev_holdings, holdings, tickers):
+    """직전 분기에만 있고 티커도 찾지 못한 CUSIP 의 보유 주식 수를 발행사명 기준으로 합친다.
+    재설립/재상장으로 CUSIP 이 바뀐 회사(예: XOM, OKE, CCL)는 옛 CUSIP 이 OpenFIGI 에서 조회되지 않으므로
+    발행사명으로 이어 붙이기 위함이다.
+    """
+    shares = {}
+    for cusip, holding in prev_holdings.items():
+        if cusip in holdings or cusip in tickers:
+            continue
+        name = _normalize_name(holding["name"])
+        if name:
+            shares[name] = shares.get(name, 0) + holding["shares"]
+    return shares
+
+
+def _activity(key, name, current_shares, prev_shares_by_key, prev_unmapped_by_name):
+    if prev_shares_by_key is None:
+        return None, None
+    prev_shares = prev_shares_by_key.get(key) or prev_unmapped_by_name.get(_normalize_name(name))
+    if not prev_shares:
+        return "buy", None
+    shares = current_shares[key]
+    if shares > prev_shares:
+        return "add", min(round((shares - prev_shares) / prev_shares * 100, 2), MAX_ACTIVITY_VALUE)
+    if shares < prev_shares:
+        return "reduce", round((prev_shares - shares) / prev_shares * 100, 2)
+    return None, None
+
+
+def crawl_13f_portfolio(investor, sec, ticker_resolver, price_fetcher):
+    """투자자의 최근 13F 포트폴리오를 {"summary": {...}, "details": [...]} 로 돌려준다. 실패하면 None"""
+    cik = investor["cik"]
+    code = investor["code"]
+    try:
+        filings = _list_13f_filings(sec, cik)
+        periods = sorted({f["period"] for f in filings}, reverse=True)
+        if not periods:
+            logger.warning(f"{code}: 13F 신고서가 없습니다 (CIK {cik}).")
             return None
 
-        current_page_details = _parse_portfolio_details(soup)
-        if current_page_details:
-            all_details_list.extend(current_page_details)
-        logger.info(f"Collected {len(current_page_details) if current_page_details else 0} items from initial page {initial_page_url}")
+        latest_period = periods[0]
+        holdings = _aggregate_by_cusip(_get_period_rows(sec, cik, filings, latest_period))
+        if not holdings:
+            logger.warning(f"{code}: {latest_period} 13F 에 주식 보유 내역이 없습니다.")
+            return None
 
-        pages_div = soup.find("div", id="pages")
-        if pages_div:
-            logger.info(f"Pagination detected for m_code {m_code}.")
-            page_links_tags = pages_div.find_all("a", href=True)
-            urls_to_crawl_subsequent = set()
-            
-            for link_tag in page_links_tags:
-                href = link_tag['href']
-                link_text = link_tag.text.strip()
-                
-                if link_text.isdigit():
-                    page_num_in_link = int(link_text)
-                    if page_num_in_link == 1: 
-                        continue
-
-                    match = re.search(r"/m/holdings\.php\?m=" + re.escape(m_code) + r"&L=(\d+)", href)
-                    if match:
-                        actual_page_num_in_href = int(match.group(1))
-                        if page_num_in_link == actual_page_num_in_href:
-                             urls_to_crawl_subsequent.add(f"{base_url}{href}")
-            
-            sorted_urls_to_crawl = sorted(list(urls_to_crawl_subsequent))
-
-            for page_url in sorted_urls_to_crawl:
-                logger.info(f"Crawling paginated page: {page_url} for m_code {m_code}")
-                try:
-                    # time.sleep(random.uniform(0.3, 0.8)) # 필요시 주석 해제
-                    page_resp = requests.get(page_url, headers=headers, timeout=15)
-                    page_resp.raise_for_status()
-                    page_soup = BeautifulSoup(page_resp.text, "html.parser")
-                    
-                    paginated_details = _parse_portfolio_details(page_soup)
-                    if paginated_details:
-                        all_details_list.extend(paginated_details)
-                        logger.info(f"Added {len(paginated_details)} stock items from {page_url}")
-                except requests.exceptions.RequestException as e_page_req:
-                    logger.error(f"Request failed for paginated page {page_url}: {e_page_req}")
-                except Exception as e_page_parse:
-                    logger.error(f"Error parsing paginated page {page_url}: {e_page_parse}", exc_info=True)
+        prev_holdings = None
+        if len(periods) > 1:
+            prev_holdings = _aggregate_by_cusip(_get_period_rows(sec, cik, filings, periods[1]))
         else:
-            logger.info(f"No pagination detected for m_code {m_code} or first page already contains all items.")
+            logger.info(f"{code}: 직전 분기 13F 가 없어 최근 활동을 비워 둡니다.")
 
-        return {"summary": summary_data, "details": all_details_list}
+        total_value = sum(h["value"] for h in holdings.values())
+        summary = {
+            "portfolio_period": _period_label(latest_period),
+            "portfolio_date": latest_period,
+            "number_of_stocks": len(holdings),
+            "portfolio_value": total_value,
+        }
 
-    except requests.exceptions.RequestException as e_req:
-        logger.error(f"Request failed for initial page {initial_page_url}: {e_req}")
-        return None
-    except Exception as e_general:
-        logger.error(f"General error crawling page data for {m_code} on initial page {initial_page_url}: {e_general}", exc_info=True)
+        ranked = sorted(holdings.values(), key=lambda h: h["value"], reverse=True)
+        if investor.get("max_holdings"):
+            ranked = ranked[:investor["max_holdings"]]
+
+        # 상세에 넣을 종목 + 직전 분기에만 있는 종목(CUSIP 이 바뀐 경우를 찾기 위해)의 티커를 조회한다
+        lookup_cusips = [h["cusip"] for h in ranked]
+        if prev_holdings:
+            lookup_cusips += [c for c in prev_holdings if c not in holdings]
+        tickers = ticker_resolver.resolve(lookup_cusips)
+        prices = price_fetcher.get_prices([tickers[h["cusip"]] for h in ranked if h["cusip"] in tickers])
+
+        current_shares = _shares_by_key(holdings, tickers)
+        prev_shares = None
+        prev_unmapped = {}
+        if prev_holdings is not None:
+            prev_shares = _shares_by_key(prev_holdings, tickers)
+            prev_unmapped = _unmapped_shares_by_name(prev_holdings, holdings, tickers)
+
+        details = []
+        for holding in ranked:
+            cusip = holding["cusip"]
+            ticker = tickers.get(cusip)
+            reported_price = round(holding["value"] / holding["shares"], 4)
+            price = prices.get(ticker) if ticker else None
+            current_price = price["current_price"] if price else None
+            reported_price_rate = None
+            if current_price is not None and reported_price > 0:
+                rate = (current_price - reported_price) / reported_price * 100
+                reported_price_rate = round(max(-MAX_PRICE_RATE, min(rate, MAX_PRICE_RATE)), 4)
+            activity_type, activity_value = _activity(ticker or cusip, holding["name"], current_shares, prev_shares, prev_unmapped)
+
+            details.append({
+                # 티커를 찾지 못하면 CUSIP 을 대신 넣는다 (ticker 컬럼이 NOT NULL)
+                "ticker": ticker or cusip,
+                "name": holding["name"],
+                "portfolio_rate": round(holding["value"] / total_value * 100, 2) if total_value else 0,
+                "shares": holding["shares"],
+                "reported_price": reported_price,
+                "reported_value_amount": holding["value"],
+                "current_price": current_price,
+                "reported_price_rate": reported_price_rate,
+                "low_52_week": price["low_52_week"] if price else None,
+                "high_52_week": price["high_52_week"] if price else None,
+                "recent_activity_type": activity_type,
+                "recent_activity_value": activity_value,
+            })
+
+        logger.info(
+            f"{code}: {summary['portfolio_period']} 보유 {summary['number_of_stocks']}종목, "
+            f"${total_value / 1_000_000_000:.2f}B, 상세 {len(details)}건 "
+            f"(티커 없음 {sum(1 for h in ranked if h['cusip'] not in tickers)}건, "
+            f"시세 없음 {sum(1 for d in details if d['current_price'] is None)}건)"
+        )
+        return {"summary": summary, "details": details}
+
+    except Exception as e:
+        logger.error(f"{code}: 13F 수집 중 오류 (CIK {cik}): {e}", exc_info=True)
         return None

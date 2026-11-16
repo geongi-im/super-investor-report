@@ -69,7 +69,11 @@ def format_portfolio_data(portfolio_data):
     for detail in details:
         # 수익률 계산 (reported_price_rate 사용)
         change = detail['reported_price_rate']
-        change_str = f"+{change:.2f}%" if change >= 0 else f"{change:.2f}%"
+        # 시세가 없는 종목은 빈 문자열로 두면 템플릿이 '-' 로 표시한다
+        if change is None:
+            change_str = ""
+        else:
+            change_str = f"+{change:.2f}%" if change >= 0 else f"{change:.2f}%"
         
         # 활동 타입과 값 포맷팅
         activity = ""
